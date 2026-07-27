@@ -2,6 +2,12 @@
 
 一个只读 Windows 桌面工具：连接数据库、从元数据中选择表、按一个可选字段条件筛选，并导出为带格式的 Excel 工作簿。
 
+## 项目预览
+
+![1.png](.github/images/1.png)
+
+![2.png](.github/images/2.png)
+
 ## 当前能力
 
 - 支持 SQLite、MySQL/MariaDB、PostgreSQL、SQL Server、MongoDB 的连接配置。
