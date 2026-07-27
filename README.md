@@ -1,12 +1,10 @@
 # DataExport Studio（数导工坊）
 
-一个只读 Windows 桌面工具：连接数据库、从元数据中选择表、按一个可选字段条件筛选，并导出为带格式的 Excel 工作簿。
+一个只读 Windows 10/11 桌面工具：连接数据库、从元数据中选择表、按一个可选字段条件筛选，并导出为带格式的 Excel 工作簿。
 
 ## 项目预览
 
-![1.png](.github/images/1.png)
-
-![2.png](.github/images/2.png)
+![home.png](.github/images/home.png)
 
 ## 当前能力
 
@@ -63,7 +61,7 @@ MongoDB 使用 `pymongo 3.13` 直接连接，不需要安装 MongoDB 客户端�
 
 未提供图标时，构建仍会正常完成，只使用默认应用图标。图标仅在构建时使用，发布后的 EXE 不依赖项目目录中的 `.ico` 文件。
 
-默认构建目录包，生成的可执行文件为 `dist/数据库导出工具/数据库导出工具.exe`：
+默认构建目录包，生成的可执行文件为 `dist/数据库导出工具.exe`：
 
 ```powershell
 .\scripts\build.ps1
