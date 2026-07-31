@@ -1,0 +1,81 @@
+name: CI/CD
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: 设置 Python 环境
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.9"
+          cache: pip
+
+      - name: 安装依赖
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,build]"
+
+      - name: 运行测试
+        shell: pwsh
+        run: python -m pytest -q
+
+      - name: 构建 Windows EXE
+        shell: pwsh
+        run: .\scripts\build.ps1 -OneFile -Name DataExportStudio
+
+      - name: 生成校验和
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          $assetName = "dataexport-studio_${version}_windows_amd64.exe"
+          New-Item -ItemType Directory -Force release-assets | Out-Null
+          Move-Item "dist\DataExportStudio.exe" "release-assets\$assetName"
+          (Get-FileHash "release-assets\$assetName" -Algorithm SHA256).Hash.ToLower() + "  " + $assetName | Set-Content -NoNewline "release-assets\SHA256SUMS"
+
+      - name: 生成发布说明
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}"
+          $previousTag = git describe --tags --abbrev=0 HEAD^ 2>$null
+          if ($previousTag) {
+            $commits = git log "$previousTag..HEAD" --pretty=format:"- %s (%h)" --no-merges
+          } else {
+            $commits = git log --pretty=format:"- %s (%h)" --no-merges -10
+          }
+          @"
+          ## DataExport Studio $version
+
+          ### 构建信息
+          - 平台：Windows AMD64
+          - 文件：dataexport-studio_$($version.TrimStart('v'))_windows_amd64.exe
+          - Commit：${{ github.sha }}
+
+          ### 更新内容
+          $commits
+
+          ### 校验
+          下载 EXE 和 SHA256SUMS 后，可使用 Get-FileHash 校验文件完整性。
+          "@ | Set-Content release_notes.md
+
+      - name: 创建 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release_notes.md
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') || contains(github.ref_name, 'pre') }}
+          generate_release_notes: false
+          files: |
+            release-assets/*.exe
+            release-assets/SHA256SUMS

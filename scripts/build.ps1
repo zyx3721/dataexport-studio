@@ -1,5 +1,6 @@
 param(
-    [switch]$OneFile
+    [switch]$OneFile,
+    [string]$Name = "数据库导出工具"
 )
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
@@ -12,7 +13,7 @@ if (-not (Test-Path -LiteralPath $python)) {
 $arguments = @(
     "--noconfirm",
     "--clean",
-    "--name", "数据库导出工具",
+    "--name", $Name,
     "--windowed",
     "--paths", "src",
     "--hidden-import", "pymysql",
