@@ -1,7 +1,7 @@
 import mongomock
 
-from dataexport_studio.domain.models import ExportRequest, FilterCondition, FilterLogic, FilterOperator, SortDirection
-from dataexport_studio.infrastructure.database.mongodb_gateway import MongoConnection, count_rows, get_columns, get_databases, get_tables, stream_rows
+from dataexport_studio.domain.models import ExportRequest, FilterCondition, FilterLogic, FilterOperator, MongoAggregationRequest, SortDirection
+from dataexport_studio.infrastructure.database.mongodb_gateway import MongoConnection, count_aggregation_rows, count_rows, get_columns, get_databases, get_tables, stream_aggregation_rows, stream_rows
 
 
 def mongo_connection():
@@ -42,3 +42,24 @@ def test_mongodb_filters_sorts_and_streams_documents(tmp_path):
 
     assert headers == ["_id", "department.name", "name", "score", "tags"]
     assert values[0][1:] == ("Engineering", "Ada", 95, '["python", "data"]')
+
+
+def test_mongodb_aggregation_supports_lookup(tmp_path):
+    connection = mongo_connection()
+    connection.client["analytics"]["departments"].insert_one({"name": "Engineering", "leader": "Grace"})
+    request = MongoAggregationRequest(
+        database="analytics",
+        collection="employees",
+        pipeline=(
+            {"$lookup": {"from": "departments", "localField": "department.name", "foreignField": "name", "as": "department_info"}},
+            {"$unwind": "$department_info"},
+            {"$project": {"_id": 0, "员工姓名": "$name", "部门负责人": "$department_info.leader"}},
+        ),
+        destination=tmp_path / "employees.xlsx",
+    )
+
+    assert count_aggregation_rows(connection, request) == 1
+    headers, rows = stream_aggregation_rows(connection, request)
+
+    assert headers == ["员工姓名", "部门负责人"]
+    assert list(rows) == [("Ada", "Grace")]

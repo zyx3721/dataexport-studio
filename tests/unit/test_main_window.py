@@ -4,6 +4,8 @@ from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import QFileDialog, QFrame, QMessageBox, QScrollArea
 from PySide6.QtCore import Qt
 
+from dataexport_studio.domain.models import DatabaseType
+from dataexport_studio.ui import main_window as main_window_module
 from dataexport_studio.ui.main_window import DropdownBox, MainWindow
 
 
@@ -120,6 +122,39 @@ def test_non_sqlite_disables_file_field_and_hides_spin_buttons(qtbot):
 
     window.port.clear()
     assert window._config().port is None
+
+
+def test_switching_database_type_clears_the_sqlite_file_path(qtbot, tmp_path):
+    window = MainWindow()
+    qtbot.addWidget(window)
+    sqlite_file = configure_sqlite(window, tmp_path)
+
+    window.database_type.setCurrentText("MySQL / MariaDB")
+
+    assert window.database.text() == ""
+    assert window._config().database == ""
+
+
+def test_switching_database_type_keeps_the_previous_connection_until_reconnected(qtbot):
+    class Engine:
+        def __init__(self):
+            self.disposed = False
+
+        def dispose(self):
+            self.disposed = True
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    engine = Engine()
+    window._engine = engine
+    window._connected_database_type = window._database_type()
+
+    window.database_type.setCurrentText("MySQL / MariaDB")
+
+    assert not engine.disposed
+    assert window._engine is engine
+    assert window._connected_database_type is DatabaseType.SQLSERVER
+    assert not window.disconnect_button.isEnabled()
 
 
 def test_mongodb_uses_default_port_and_allows_anonymous_connection_fields(qtbot):
@@ -299,6 +334,16 @@ def test_export_file_name_defaults_to_selected_database_and_can_be_customized(qt
     assert window.file_name.text() == "custom.xlsx"
 
 
+def test_graphical_export_file_name_uses_database_type_before_metadata_is_loaded(qtbot):
+    window = MainWindow()
+    qtbot.addWidget(window)
+
+    window._file_name_customized = False
+    window._set_default_file_name()
+
+    assert window.file_name.text() == f"sql-server-data-{datetime.now():%Y%m%d}.xlsx"
+
+
 def test_export_progress_uses_the_query_total(qtbot):
     window = MainWindow()
     qtbot.addWidget(window)
@@ -338,6 +383,7 @@ def test_enabled_sort_or_filter_requires_complete_configuration(qtbot, tmp_path)
     window = MainWindow()
     qtbot.addWidget(window)
     window._engine = Engine()
+    window._connected_database_type = window._database_type()
     window.table.addItem("people")
     window.table.setCurrentText("people")
     window.export_directory.setText(str(tmp_path))
@@ -354,3 +400,184 @@ def test_enabled_sort_or_filter_requires_complete_configuration(qtbot, tmp_path)
     window._start_export()
     assert "完整填写每个筛选条件" in window.result.text()
     assert window.result.property("state") == "error"
+
+
+def test_custom_sql_mode_hides_graphical_controls_and_requires_sql(qtbot, tmp_path):
+    window = MainWindow()
+    qtbot.addWidget(window)
+    configure_sqlite(window, tmp_path)
+    window._connect()
+
+    window.query_mode.setCurrentIndex(1)
+
+    assert window.custom_sql_controls.isVisible() is False
+    window.show()
+    assert window.custom_sql_controls.isVisible()
+    assert window.custom_sql.isEnabled()
+    assert not window.graphical_data_controls.isVisible()
+    assert window.filter_section.isHidden()
+    assert window.file_name.text() == f"sqlite-query-{datetime.now():%Y%m%d}.xlsx"
+
+    window.export_directory.setText(str(tmp_path))
+    window.file_name.setText("query.xlsx")
+    window._start_export()
+
+    assert "请输入自定义 SQL" in window.result.text()
+    assert window.result.property("state") == "error"
+
+
+def test_custom_sql_file_name_uses_database_type_not_selected_database(qtbot):
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.database_type.setCurrentText("MySQL / MariaDB")
+    window.query_mode.setCurrentIndex(1)
+    window.custom_database.addItem("information_schema")
+    window.custom_database.setCurrentText("information_schema")
+    window._file_name_customized = False
+    window._set_default_file_name()
+
+    assert window.file_name.text() == f"mysql-query-{datetime.now():%Y%m%d}.xlsx"
+
+
+def test_custom_sql_target_database_reconnects_before_export(qtbot, monkeypatch):
+    class Engine:
+        def __init__(self, database):
+            self.url = type("Url", (), {"database": database})()
+            self.disposed = False
+
+        def dispose(self):
+            self.disposed = True
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.database_type.setCurrentText("MySQL / MariaDB")
+    window.host.setText("db.example")
+    window.port.setText("3306")
+    window.username.setText("reader")
+    window.password.setText("password")
+    previous = Engine(None)
+    window._engine = previous
+    window._connected_database_type = window._database_type()
+    window.query_mode.setCurrentIndex(1)
+    window.custom_database.addItems(["", "analytics"])
+    created = []
+    monkeypatch.setattr(main_window_module, "create_database_engine", lambda config: created.append(config) or Engine(config.database))
+    monkeypatch.setattr(main_window_module, "test_connection", lambda _engine: None)
+
+    window.custom_database.setCurrentText("analytics")
+
+    assert created[0].database == "analytics"
+    assert previous.disposed
+    assert window._engine.url.database == "analytics"
+
+
+def test_switching_database_type_resets_connection_and_export_configuration(qtbot):
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.host.setText("db.example")
+    window.username.setText("reader")
+    window.password.setText("password")
+    window.database.setText("C:/data/example.sqlite")
+    window.custom_sql.setPlainText("SELECT 1")
+    window.export_directory.setText("C:/exports")
+    window.file_name.setText("custom.xlsx")
+    window.max_rows.setText("20")
+    window.query_mode.setCurrentIndex(1)
+
+    window.database_type.setCurrentText("PostgreSQL")
+
+    assert window.host.text() == ""
+    assert window.username.text() == ""
+    assert window.password.text() == ""
+    assert window.database.text() == ""
+    assert window.custom_sql.toPlainText() == ""
+    assert window.export_directory.text() == ""
+    assert window.max_rows.text() == "1000000"
+    assert window.query_mode.currentData() == "graphical"
+    assert window.port.text() == "5432"
+
+
+def test_switching_back_before_connecting_restores_previous_configuration(qtbot):
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.database_type.setCurrentText("MySQL / MariaDB")
+    window.host.setText("mysql.example")
+    window.port.setText("3307")
+    window.username.setText("reader")
+    window.password.setText("password")
+    window.custom_sql.setPlainText("SELECT 1")
+    window.query_mode.setCurrentIndex(1)
+    window.export_directory.setText("C:/exports")
+    window.file_name.setText("mysql.xlsx")
+    window.max_rows.setText("500")
+    window._engine = type("Engine", (), {"dispose": lambda self: None})()
+    window._connected_database_type = DatabaseType.MYSQL
+
+    window.database_type.setCurrentText("PostgreSQL")
+
+    assert window.host.text() == ""
+    assert "MySQL / MariaDB 连接仍保持" in window.connection_status.text()
+    assert window.connection_status.property("state") == "warning"
+
+    window.database_type.setCurrentText("MySQL / MariaDB")
+
+    assert window.host.text() == "mysql.example"
+    assert window.port.text() == "3307"
+    assert window.username.text() == "reader"
+    assert window.password.text() == "password"
+    assert window.custom_sql.toPlainText() == "SELECT 1"
+    assert window.query_mode.currentData() == "custom_sql"
+    assert window.export_directory.text() == "C:/exports"
+    assert window.file_name.text() == "mysql.xlsx"
+    assert window.max_rows.text() == "500"
+    assert "已恢复 MySQL / MariaDB 上次配置；连接仍保持" in window.connection_status.text()
+    assert window.connection_status.property("state") == "success"
+
+
+def test_database_type_hint_keeps_the_actual_connection_when_switching_again(qtbot):
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window._engine = type("Engine", (), {"dispose": lambda self: None})()
+    window._connected_database_type = DatabaseType.SQLSERVER
+
+    window.database_type.setCurrentText("MySQL / MariaDB")
+    window.database_type.setCurrentText("PostgreSQL")
+
+    assert "SQL Server 连接仍保持" in window.connection_status.text()
+    assert "MySQL / MariaDB 连接仍保持" not in window.connection_status.text()
+
+
+def test_successful_new_connection_discards_the_previous_connection_snapshot(qtbot, monkeypatch):
+    class Engine:
+        def __init__(self):
+            self.disposed = False
+
+        def dispose(self):
+            self.disposed = True
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    previous = Engine()
+    replacement = Engine()
+    window._engine = previous
+    window._connected_database_type = DatabaseType.SQLSERVER
+    window.host.setText("sqlserver.example")
+    window.username.setText("reader")
+    window.password.setText("password")
+    window.database_type.setCurrentText("MySQL / MariaDB")
+    window.host.setText("mysql.example")
+    window.username.setText("reader")
+    window.password.setText("password")
+    monkeypatch.setattr(main_window_module, "create_database_engine", lambda _config: replacement)
+    monkeypatch.setattr(main_window_module, "test_connection", lambda _engine: None)
+    monkeypatch.setattr(main_window_module, "get_databases", lambda _engine: [])
+    monkeypatch.setattr(main_window_module, "get_server_databases", lambda _engine: [])
+    monkeypatch.setattr(main_window_module, "get_tables", lambda *_args: [])
+
+    window._connect()
+
+    assert previous.disposed
+    assert DatabaseType.SQLSERVER not in window._configuration_snapshots
+    window.database_type.setCurrentText("SQL Server")
+    assert window.host.text() == ""
+    assert window.port.text() == "1433"

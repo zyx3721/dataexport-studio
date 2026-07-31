@@ -1,4 +1,5 @@
 from itertools import chain, islice
+from decimal import Decimal
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence
 
@@ -95,6 +96,8 @@ def _data_cell(sheet, value):
 
 
 def _safe_text(value):
+    if isinstance(value, (int, float, Decimal)) and not isinstance(value, bool):
+        return value
     text = " ".join(str(value if value is not None else "").split())
     return "'{}".format(text) if text.startswith(("=", "+", "-", "@")) else text
 

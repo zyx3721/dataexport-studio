@@ -1,12 +1,15 @@
 from pathlib import Path
+from decimal import Decimal
 
 import pytest
 from openpyxl import load_workbook
 from sqlalchemy import Column, Integer, MetaData, String, Table, create_engine, insert
 
 from dataexport_studio.application.export_service import ExportService
-from dataexport_studio.domain.errors import ExportError
-from dataexport_studio.domain.models import ExportRequest, FilterCondition, FilterLogic, FilterOperator, SortDirection
+from dataexport_studio.domain.errors import ExportError, ValidationError
+from dataexport_studio.domain.models import CustomSqlRequest, ExportRequest, FilterCondition, FilterLogic, FilterOperator, SortDirection
+from dataexport_studio.infrastructure.database.sqlalchemy_gateway import validate_custom_sql
+from dataexport_studio.infrastructure.excel.workbook_writer import write_workbook
 
 
 def test_exports_filtered_sqlite_table_with_expected_formatting(tmp_path: Path):
@@ -39,7 +42,7 @@ def test_exports_filtered_sqlite_table_with_expected_formatting(tmp_path: Path):
     assert totals == [(1, 1)]
     assert progress[-1] == 1
     assert [cell.value for cell in sheet[1]] == ["id", "name", "score"]
-    assert [cell.value for cell in sheet[2]] == ["1", "Ada", "95"]
+    assert [cell.value for cell in sheet[2]] == [1, "Ada", 95]
     assert sheet["A1"].font.bold is True
     assert sheet["A1"].font.name == "SimSun"
     assert sheet["A1"].fill.fill_type is None
@@ -144,3 +147,67 @@ def test_exports_formula_like_text_as_plain_text(tmp_path: Path):
     cell = load_workbook(request.destination).active["B2"]
     assert cell.data_type != "f"
     assert cell.value == "'=HYPERLINK(\"https://example.com\")"
+
+
+def test_preserves_native_numbers_but_keeps_numeric_text_as_text(tmp_path: Path):
+    destination = tmp_path / "numbers.xlsx"
+
+    write_workbook(
+        destination,
+        ["整数", "小数", "文本编号"],
+        [(3, Decimal("1500.25"), "00123")],
+        max_rows=10,
+    )
+
+    sheet = load_workbook(destination).active
+    assert sheet["A2"].data_type == "n"
+    assert sheet["B2"].data_type == "n"
+    assert sheet["A2"].value == 3
+    assert sheet["B2"].value == 1500.25
+    assert sheet["C2"].data_type == "s"
+    assert sheet["C2"].value == "00123"
+
+
+def test_exports_custom_sql_join_and_cte(tmp_path: Path):
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    metadata = MetaData()
+    departments = Table("departments", metadata, Column("id", Integer, primary_key=True), Column("name", String))
+    people = Table("people", metadata, Column("id", Integer, primary_key=True), Column("name", String), Column("department_id", Integer))
+    metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(insert(departments), [{"id": 1, "name": "Engineering"}])
+        connection.execute(insert(people), [{"id": 1, "name": "Ada", "department_id": 1}])
+
+    request = CustomSqlRequest(
+        query="""
+            WITH active_people AS (
+                SELECT id, name, department_id FROM people
+            )
+            SELECT p.name AS employee, d.name AS department
+            FROM active_people p
+            LEFT JOIN departments d ON d.id = p.department_id
+        """,
+        destination=tmp_path / "custom-query.xlsx",
+    )
+
+    count, _ = ExportService().export(engine, request)
+
+    sheet = load_workbook(request.destination).active
+    assert count == 1
+    assert [cell.value for cell in sheet[1]] == ["employee", "department"]
+    assert [cell.value for cell in sheet[2]] == ["Ada", "Engineering"]
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT * FROM people; DELETE FROM people",
+        "INSERT INTO people (id) VALUES (1)",
+        "UPDATE people SET name = 'Ada'",
+        "SELECT * INTO copied_people FROM people",
+        "EXEC refresh_report",
+    ],
+)
+def test_custom_sql_rejects_non_read_only_statements(query):
+    with pytest.raises(ValidationError, match="自定义 SQL"):
+        validate_custom_sql(query)

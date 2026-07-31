@@ -33,6 +33,12 @@ class SortDirection(str, Enum):
     DESCENDING = "desc"
 
 
+class QueryMode(str, Enum):
+    GRAPHICAL = "graphical"
+    CUSTOM_SQL = "custom_sql"
+    MONGODB_AGGREGATION = "mongodb_aggregation"
+
+
 @dataclass(frozen=True)
 class ConnectionConfig:
     database_type: DatabaseType
@@ -60,5 +66,23 @@ class ExportRequest:
     filter_logic: FilterLogic = FilterLogic.AND
     sort_column: Optional[str] = None
     sort_direction: SortDirection = SortDirection.ASCENDING
+    max_rows: int = 1_000_000
+    batch_size: int = 1_000
+
+
+@dataclass(frozen=True)
+class CustomSqlRequest:
+    query: str
+    destination: Path
+    max_rows: int = 1_000_000
+    batch_size: int = 1_000
+
+
+@dataclass(frozen=True)
+class MongoAggregationRequest:
+    database: str
+    collection: str
+    pipeline: tuple[dict, ...]
+    destination: Path
     max_rows: int = 1_000_000
     batch_size: int = 1_000

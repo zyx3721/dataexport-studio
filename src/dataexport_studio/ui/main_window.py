@@ -1,5 +1,6 @@
 from dataclasses import replace
 from datetime import datetime
+import json
 from pathlib import Path
 import re
 from typing import Optional
@@ -26,17 +27,21 @@ from PySide6.QtWidgets import (
 from ..domain.errors import DataExportError
 from ..domain.models import (
     ConnectionConfig,
+    CustomSqlRequest,
     DatabaseType,
     ExportRequest,
     FilterCondition,
     FilterLogic,
     FilterOperator,
+    MongoAggregationRequest,
+    QueryMode,
     SortDirection,
 )
 from ..infrastructure.database.database_gateway import (
     create_database_engine,
     get_columns,
     get_databases,
+    get_server_databases,
     get_tables,
     test_connection,
 )
@@ -49,10 +54,14 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self._engine = None
+        self._connected_database_type = None
         self._thread: Optional[QThread] = None
         self._worker: Optional[ExportWorker] = None
         self._progress_value = 0
         self._export_total = 0
+        self._configuration_snapshots = {}
+        self._active_form_database_type = None
+        self._last_connected_database_type = None
         self.setWindowTitle("DataExport Studio | 数导工坊")
         self.setMinimumSize(680, 520)
         self.resize(1180, 820)
@@ -189,7 +198,7 @@ class MainWindow(QMainWindow):
 
 
     def _refresh_filter_rows(self):
-        enabled = self._engine is not None and self.enable_filter.isChecked()
+        enabled = self._has_active_connection() and not self._is_custom_sql_mode() and self.enable_filter.isChecked()
         columns = self._available_columns()
         for item in self.filter_rows:
             selected = item["field"].currentText()
@@ -232,8 +241,9 @@ class MainWindow(QMainWindow):
             QLabel#status[state="error"] { color: #B42318; font-weight: 700; }
             QLabel#status[state="success"] { color: #007D68; font-weight: 700; }
             QLineEdit, QComboBox { min-height: 38px; border: 2px solid #1A2A43; border-radius: 0; padding: 1px 10px; background: #FFFFFF; color: #1B2940; selection-background-color: #6464E9; }
-            QLineEdit:focus, QComboBox:focus { border-color: #5D5CE2; background: #FFFEFC; }
-            QLineEdit:disabled, QComboBox:disabled { border-color: #B8BFCA; color: #9AA4B3; background: #F2F0E9; }
+            QPlainTextEdit { border: 2px solid #1A2A43; border-radius: 0; padding: 8px 10px; background: #FFFFFF; color: #1B2940; font-family: "Consolas"; font-size: 12px; selection-background-color: #6464E9; }
+            QLineEdit:focus, QComboBox:focus, QPlainTextEdit:focus { border-color: #5D5CE2; background: #FFFEFC; }
+            QLineEdit:disabled, QComboBox:disabled, QPlainTextEdit:disabled { border-color: #B8BFCA; color: #9AA4B3; background: #F2F0E9; }
             QComboBox::drop-down { border: 0; width: 28px; }
             QComboBox QAbstractItemView { background: #FFFFFF; color: #1B2940; border: 2px solid #1A2A43; selection-background-color: #E7E6FF; }
             QPushButton { min-height: 38px; border: 2px solid #1A2A43; border-radius: 0; padding: 0 18px; background: #5D5CE2; color: #FFFFFF; font-family: "Microsoft YaHei UI"; font-weight: 800; }
@@ -264,19 +274,41 @@ class MainWindow(QMainWindow):
         )
         self.password_toggle_action.setToolTip("显示密码" if visible else "隐藏密码")
 
-    def _config(self):
+    def _config(self, database_override=None):
         port_text = self.port.text().strip()
         database_type = self._database_type()
+        database = ""
+        if database_type is DatabaseType.SQLITE:
+            database = self.database.text().strip()
+        elif database_override is not None:
+            database = database_override
+        else:
+            database = self._selected_custom_database() if self._is_custom_sql_mode() else (
+                self._selected_database() if database_type is DatabaseType.SQLSERVER else ""
+            )
         return ConnectionConfig(
             database_type=database_type,
             host=self.host.text().strip(),
             port=int(port_text) if port_text else None,
-            database=self._selected_database() if database_type is DatabaseType.SQLSERVER else self.database.text().strip(),
+            database=database,
             username=self.username.text().strip(),
             password=self.password.text(),
         )
 
     def _update_connection_fields(self):
+        selected_type = self._database_type()
+        previous_type = self._active_form_database_type
+        if self._thread and self._engine:
+            self.database_type.blockSignals(True)
+            self.database_type.setCurrentText(self._connected_database_type.value)
+            self.database_type.blockSignals(False)
+            self._set_connection_status("导出进行中，暂不能切换数据库类型。", "warning")
+            return
+        if previous_type is not None and previous_type is not selected_type:
+            self._store_configuration_snapshot(previous_type)
+        restored = self._restore_configuration_snapshot(selected_type)
+        if not restored:
+            self._reset_configuration_for_database_type()
         is_sqlite = self.database_type.currentText() == DatabaseType.SQLITE.value
         self.host.setEnabled(not is_sqlite)
         self.port.setEnabled(not is_sqlite)
@@ -291,7 +323,200 @@ class MainWindow(QMainWindow):
             DatabaseType.SQLSERVER.value: 1433,
             DatabaseType.MONGODB.value: 27017,
         }
-        self.port.setText(str(defaults.get(self.database_type.currentText(), "")))
+        if not restored:
+            self.port.setText(str(defaults.get(self.database_type.currentText(), "")))
+        self._active_form_database_type = selected_type
+        if hasattr(self, "query_mode"):
+            self._update_query_mode()
+        if previous_type is not None and previous_type is not selected_type:
+            if self._has_active_connection():
+                self._set_connection_status(
+                    "已恢复 {} 上次配置；连接仍保持。".format(selected_type.value),
+                    "success",
+                )
+            elif self._connected_database_type is not None:
+                self._set_connection_status(
+                    "当前显示 {} 配置；{} 连接仍保持，可切回后继续使用。".format(
+                        selected_type.value,
+                        self._connected_database_type.value,
+                    ),
+                    "warning",
+                )
+            elif restored:
+                self._set_connection_status("已恢复 {} 上次配置，尚未连接。".format(selected_type.value), "idle")
+        self.disconnect_button.setEnabled(self._has_active_connection())
+        self._set_data_controls_enabled(self._has_active_connection())
+
+    def _store_configuration_snapshot(self, database_type):
+        self._configuration_snapshots[database_type] = {
+            "host": self.host.text(),
+            "port": self.port.text(),
+            "database": self.database.text(),
+            "username": self.username.text(),
+            "password": self.password.text(),
+            "query_mode": self.query_mode.currentIndex(),
+            "schema_items": self._dropdown_items(self.schema),
+            "schema": self.schema.currentText(),
+            "table_items": self._dropdown_items(self.table),
+            "table": self.table.currentText(),
+            "custom_database_items": self._dropdown_items(self.custom_database),
+            "custom_database": self.custom_database.currentText(),
+            "custom_collection_items": self._dropdown_items(self.custom_collection),
+            "custom_collection": self.custom_collection.currentText(),
+            "custom_sql": self.custom_sql.toPlainText(),
+            "sort_enabled": self.sort_enabled.isChecked(),
+            "sort_column_items": self._dropdown_items(self.sort_column),
+            "sort_column": self.sort_column.currentText(),
+            "sort_direction": self.sort_direction.currentIndex(),
+            "filter_enabled": self.enable_filter.isChecked(),
+            "filter_logic": self.filter_logic.currentIndex(),
+            "filters": [
+                (item["field"].currentText(), item["operator"].currentIndex(), item["value"].text())
+                for item in self.filter_rows
+            ],
+            "export_directory": self.export_directory.text(),
+            "file_name": self.file_name.text(),
+            "file_name_customized": self._file_name_customized,
+            "max_rows": self.max_rows.text(),
+        }
+
+    def _restore_configuration_snapshot(self, database_type):
+        snapshot = self._configuration_snapshots.get(database_type)
+        if snapshot is None:
+            return False
+        self.host.setText(snapshot["host"])
+        self.port.setText(snapshot["port"])
+        self.database.setText(snapshot["database"])
+        self.username.setText(snapshot["username"])
+        self.password.setText(snapshot["password"])
+        self.query_mode.setCurrentIndex(snapshot["query_mode"])
+        self._restore_dropdown_items(self.schema, snapshot["schema_items"])
+        self.schema.setCurrentText(snapshot["schema"])
+        self._restore_dropdown_items(self.table, snapshot["table_items"])
+        self.table.setCurrentText(snapshot["table"])
+        self._restore_dropdown_items(self.custom_database, snapshot["custom_database_items"])
+        self.custom_database.setCurrentText(snapshot["custom_database"])
+        self._restore_dropdown_items(self.custom_collection, snapshot["custom_collection_items"])
+        self.custom_collection.setCurrentText(snapshot["custom_collection"])
+        self.custom_sql.setPlainText(snapshot["custom_sql"])
+        self.sort_enabled.setChecked(snapshot["sort_enabled"])
+        self._restore_dropdown_items(self.sort_column, snapshot["sort_column_items"])
+        self.sort_column.setCurrentText(snapshot["sort_column"])
+        self.sort_direction.setCurrentIndex(snapshot["sort_direction"])
+        self.enable_filter.setChecked(snapshot["filter_enabled"])
+        self.filter_logic.setCurrentIndex(snapshot["filter_logic"])
+        while len(self.filter_rows) < len(snapshot["filters"]):
+            self._add_filter_row()
+        while len(self.filter_rows) > len(snapshot["filters"]):
+            self._remove_filter_row(self.filter_rows[-1]["row"])
+        for item, (field, operator_index, value) in zip(self.filter_rows, snapshot["filters"]):
+            item["field"].setCurrentText(field)
+            item["operator"].setCurrentIndex(operator_index)
+            item["value"].setText(value)
+        self.export_directory.setText(snapshot["export_directory"])
+        self.file_name.setText(snapshot["file_name"])
+        # Preserve the exact previous filename until the user changes it or starts a new configuration.
+        self._file_name_customized = bool(snapshot["file_name"])
+        self.max_rows.setText(snapshot["max_rows"])
+        self._set_export_progress(0)
+        self._set_export_status("导出任务尚未开始", "idle")
+        return True
+
+    @staticmethod
+    def _dropdown_items(dropdown):
+        return [dropdown.itemText(index) for index in range(dropdown.count())]
+
+    @staticmethod
+    def _restore_dropdown_items(dropdown, items):
+        dropdown.blockSignals(True)
+        dropdown.clear()
+        dropdown.addItems(items)
+        dropdown.blockSignals(False)
+
+    def _reset_configuration_for_database_type(self):
+        """Clear state that cannot safely be shared between database backends."""
+        self.host.clear()
+        self.database.clear()
+        self.username.clear()
+        self.password.clear()
+        self.schema.clear()
+        self.table.clear()
+        self.sort_column.clear()
+        self.custom_database.clear()
+        self.custom_collection.clear()
+        self.custom_sql.clear()
+        self.sort_enabled.setChecked(False)
+        self.enable_filter.setChecked(False)
+        self.filter_logic.setCurrentIndex(0)
+        while len(self.filter_rows) > 1:
+            self._remove_filter_row(self.filter_rows[-1]["row"])
+        filter_row = self.filter_rows[0]
+        filter_row["field"].clear()
+        filter_row["operator"].setCurrentIndex(0)
+        filter_row["value"].clear()
+        self.query_mode.setCurrentIndex(0)
+        self.export_directory.clear()
+        self.max_rows.setText("1000000")
+        self._file_name_customized = False
+        self._set_export_progress(0)
+        self._set_export_status("导出任务尚未开始", "idle")
+        self._set_connection_status("等待连接", "idle")
+
+    def _query_mode(self):
+        try:
+            return QueryMode(self.query_mode.currentData())
+        except (TypeError, ValueError):
+            return QueryMode.GRAPHICAL
+
+    def _is_custom_sql_mode(self):
+        return self._query_mode() is QueryMode.CUSTOM_SQL
+
+    def _is_mongodb_aggregation_mode(self):
+        return self._query_mode() is QueryMode.MONGODB_AGGREGATION
+
+    def _update_query_mode(self, _index=None):
+        if self._database_type() is DatabaseType.MONGODB and self._is_custom_sql_mode():
+            self.query_mode.blockSignals(True)
+            self.query_mode.setCurrentIndex(0)
+            self.query_mode.blockSignals(False)
+            self._set_connection_status("MongoDB 暂不支持自定义 SQL，请使用图形化配置。", "warning")
+        if self._database_type() is not DatabaseType.MONGODB and self._is_mongodb_aggregation_mode():
+            self.query_mode.blockSignals(True)
+            self.query_mode.setCurrentIndex(0)
+            self.query_mode.blockSignals(False)
+            self._set_connection_status("自定义 MongoDB 聚合仅支持 MongoDB。", "warning")
+        custom_sql_mode = self._is_custom_sql_mode()
+        aggregation_mode = self._is_mongodb_aggregation_mode()
+        custom_mode = custom_sql_mode or aggregation_mode
+        self.graphical_data_controls.setVisible(not custom_mode)
+        self.custom_sql_controls.setVisible(custom_mode)
+        self.custom_database_control.setVisible(custom_mode)
+        self.custom_collection_control.setVisible(aggregation_mode)
+        self.filter_section.setVisible(not custom_mode)
+        self.custom_sql.setPlaceholderText(
+            '[{"$lookup":{"from":"customers","localField":"customerId","foreignField":"_id","as":"customer"}}]'
+            if aggregation_mode else "示例：SELECT a.id, b.name FROM orders a LEFT JOIN customers b ON b.id = a.customer_id"
+        )
+        self.custom_query_label.setText(
+            "MongoDB 聚合管道（JSON 数组，仅允许只读阶段）"
+            if aggregation_mode else "SQL 查询（仅允许单条 SELECT 或 WITH ... SELECT）"
+        )
+        connected = self._has_active_connection()
+        self.schema.setEnabled(connected)
+        self.table.setEnabled(connected and not custom_mode)
+        self.sort_enabled.setEnabled(connected and not custom_mode)
+        self.custom_sql.setEnabled(connected and custom_mode)
+        self.custom_database.setEnabled(
+            connected and custom_mode and self._database_type() is not DatabaseType.SQLITE
+        )
+        self.custom_collection.setEnabled(connected and aggregation_mode)
+        if aggregation_mode:
+            self._load_custom_collections()
+        self._update_sort_state(self.sort_enabled.isChecked() and not custom_mode)
+        self._refresh_filter_rows()
+        self._set_default_file_name()
+        if hasattr(self, "_content_scroll"):
+            QTimer.singleShot(0, self._sync_content_height)
 
     def _choose_sqlite_file(self):
         initial_path = self.database.text().strip() or str(Path.home())
@@ -320,6 +545,7 @@ class MainWindow(QMainWindow):
         self.connect_button.setEnabled(False)
         QApplication.processEvents()
         previous_engine = self._engine
+        previous_database_type = self._connected_database_type
         engine = None
         try:
             self._set_connection_status("正在连接…", "warning")
@@ -327,7 +553,11 @@ class MainWindow(QMainWindow):
             test_connection(engine)
             if previous_engine and previous_engine is not engine:
                 previous_engine.dispose()
+            if previous_database_type is not None and previous_database_type is not self._database_type():
+                self._configuration_snapshots.pop(previous_database_type, None)
             self._engine = engine
+            self._connected_database_type = self._database_type()
+            self._last_connected_database_type = self._connected_database_type
             self._set_connection_status("连接成功，可选择数据库和数据表", "success")
             self.disconnect_button.setEnabled(True)
             self._set_data_controls_enabled(True)
@@ -336,16 +566,22 @@ class MainWindow(QMainWindow):
             databases = get_databases(engine)
             self.schema.addItems(databases or [""])
             self.schema.blockSignals(False)
+            self._load_custom_databases()
             self._load_tables()
         except DataExportError as exc:
             if engine is not None and engine is not self._engine:
                 engine.dispose()
-            if previous_engine is not None and previous_engine is not engine:
-                previous_engine.dispose()
-            self._engine = None
+            self._engine = previous_engine
+            self._connected_database_type = previous_database_type
             self.disconnect_button.setEnabled(False)
             self._set_data_controls_enabled(False)
-            self._set_connection_status(str(exc), "error")
+            message = str(exc)
+            if previous_database_type is not None and previous_database_type is not self._database_type():
+                message = "{}。{} 连接仍保持，可切回后继续使用。".format(
+                    message.rstrip("。；;，, "),
+                    previous_database_type.value,
+                )
+            self._set_connection_status(message, "error")
         finally:
             self.connect_button.setEnabled(True)
 
@@ -356,7 +592,10 @@ class MainWindow(QMainWindow):
         if self._engine:
             self._engine.dispose()
         self._engine = None
+        self._connected_database_type = None
+        self._last_connected_database_type = None
         self.schema.clear()
+        self.custom_database.clear()
         self.table.clear()
         self.sort_column.clear()
         self.disconnect_button.setEnabled(False)
@@ -364,7 +603,7 @@ class MainWindow(QMainWindow):
         self._set_connection_status("已退出连接", "idle")
 
     def _load_tables(self):
-        if not self._engine:
+        if not self._has_active_connection():
             return
         try:
             self._switch_sqlserver_database()
@@ -376,7 +615,7 @@ class MainWindow(QMainWindow):
             self._set_connection_status(str(exc), "warning")
 
     def _load_columns(self):
-        if not self._engine or not self.table.currentText():
+        if not self._has_active_connection() or not self.table.currentText():
             return
         try:
             columns = get_columns(self._engine, self.table.currentText(), self._selected_schema())
@@ -397,11 +636,17 @@ class MainWindow(QMainWindow):
     def _selected_database(self):
         return self.schema.currentText().strip()
 
+    def _selected_custom_database(self):
+        return self.custom_database.currentText().strip()
+
     def _database_type(self):
         return DatabaseType(self.database_type.currentText())
 
+    def _has_active_connection(self):
+        return self._engine is not None and self._connected_database_type is self._database_type()
+
     def _switch_sqlserver_database(self):
-        if self._database_type() is not DatabaseType.SQLSERVER:
+        if self._database_type() is not DatabaseType.SQLSERVER or not self._has_active_connection():
             return
         database = self._selected_database()
         if not database or self._engine.url.database == database:
@@ -411,16 +656,72 @@ class MainWindow(QMainWindow):
         self._engine.dispose()
         self._engine = engine
 
+    def _load_custom_databases(self):
+        self.custom_database.blockSignals(True)
+        self.custom_database.clear()
+        if self._database_type() is DatabaseType.SQLITE:
+            self.custom_database.addItem(Path(self.database.text().strip()).stem or "当前 SQLite 文件")
+        elif self._database_type() is DatabaseType.MONGODB:
+            self.custom_database.addItems(get_databases(self._engine))
+        else:
+            self.custom_database.addItem("")
+            self.custom_database.addItems(get_server_databases(self._engine))
+        self.custom_database.blockSignals(False)
+        self._load_custom_collections()
+
+    def _switch_custom_database(self, _index=None):
+        if not self._has_active_connection() or not (self._is_custom_sql_mode() or self._is_mongodb_aggregation_mode()):
+            return
+        database_type = self._database_type()
+        if database_type is DatabaseType.MONGODB:
+            self._load_custom_collections()
+            return
+        if database_type is DatabaseType.SQLITE:
+            return
+        database = self._selected_custom_database()
+        if not database or self._engine.url.database == database:
+            return
+        try:
+            engine = create_database_engine(self._config(database_override=database))
+            test_connection(engine)
+            self._engine.dispose()
+            self._engine = engine
+            self._set_connection_status("已切换到目标数据库，可执行自定义 SQL", "success")
+        except DataExportError as exc:
+            self.custom_database.blockSignals(True)
+            self.custom_database.setCurrentIndex(0)
+            self.custom_database.blockSignals(False)
+            self._set_connection_status(str(exc), "error")
+
+    def _load_custom_collections(self):
+        if not self._has_active_connection() or self._database_type() is not DatabaseType.MONGODB:
+            return
+        database = self._selected_custom_database()
+        self.custom_collection.blockSignals(True)
+        self.custom_collection.clear()
+        if database:
+            try:
+                self.custom_collection.addItems(get_tables(self._engine, database))
+            except DataExportError as exc:
+                self._set_connection_status(str(exc), "warning")
+        self.custom_collection.blockSignals(False)
+
     def _update_sort_state(self, enabled):
         self.sort_options.setVisible(True)
-        self.sort_column.setEnabled(enabled and self._engine is not None)
-        self.sort_direction.setEnabled(enabled and self._engine is not None)
+        self.sort_column.setEnabled(enabled and self._has_active_connection())
+        self.sort_direction.setEnabled(enabled and self._has_active_connection())
 
     def _set_data_controls_enabled(self, enabled):
         self.schema.setEnabled(enabled)
-        self.table.setEnabled(enabled)
-        self.sort_enabled.setEnabled(enabled)
-        self._update_sort_state(self.sort_enabled.isChecked())
+        custom_mode = self._is_custom_sql_mode() or self._is_mongodb_aggregation_mode()
+        self.table.setEnabled(enabled and not custom_mode)
+        self.sort_enabled.setEnabled(enabled and not custom_mode)
+        self.custom_sql.setEnabled(enabled and custom_mode)
+        self.custom_database.setEnabled(
+            enabled and custom_mode and self._database_type() is not DatabaseType.SQLITE
+        )
+        self.custom_collection.setEnabled(enabled and self._is_mongodb_aggregation_mode())
+        self._update_sort_state(self.sort_enabled.isChecked() and not custom_mode)
         self._refresh_filter_rows()
         self.export_button.setEnabled(enabled)
         self.cancel_button.setEnabled(False)
@@ -436,11 +737,20 @@ class MainWindow(QMainWindow):
     def _set_default_file_name(self):
         if self._file_name_customized:
             return
-        database = self._selected_database()
-        table = self.table.currentText().strip()
-        parts = [self._safe_file_name_part(value) for value in (database, table) if value]
-        base_name = "-".join(parts) or "export"
+        if self._is_custom_sql_mode() or self._is_mongodb_aggregation_mode():
+            base_name = f"{self._custom_query_file_type()}-query"
+            self.file_name.setText(f"{base_name}-{datetime.now():%Y%m%d}.xlsx")
+            return
+        database = self._selected_database() or self._custom_query_file_type()
+        source = self.table.currentText().strip() or "data"
+        base_name = "-".join(self._safe_file_name_part(value) for value in (database, source))
         self.file_name.setText(f"{base_name}-{datetime.now():%Y%m%d}.xlsx")
+
+    def _custom_query_file_type(self):
+        database_type = self._database_type()
+        if database_type is DatabaseType.MYSQL:
+            return "mysql"
+        return database_type.value.lower().replace(" / ", "-").replace(" ", "-")
 
     @staticmethod
     def _safe_file_name_part(value):
@@ -450,8 +760,8 @@ class MainWindow(QMainWindow):
         export_directory = self.export_directory.text().strip()
         file_name = self.file_name.text().strip()
         max_rows_text = self.max_rows.text().strip()
-        if not self._engine or not self.table.currentText() or not export_directory or not file_name:
-            self._set_export_status("请先连接数据库、选择数据表、导出目录并填写文件名。", "error")
+        if not self._has_active_connection() or not export_directory or not file_name:
+            self._set_export_status("请先连接数据库、选择导出目录并填写文件名。", "error")
             return
         if not max_rows_text:
             self._set_export_status("最大行数不能为空。", "error")
@@ -472,6 +782,62 @@ class MainWindow(QMainWindow):
             self._set_export_status("文件名不能包含路径，且仅支持 .xlsx 格式。", "error")
             return
         destination = directory / (file_name if Path(file_name).suffix else f"{file_name}.xlsx")
+        if self._is_mongodb_aggregation_mode():
+            database = self._selected_custom_database()
+            collection = self.custom_collection.currentText().strip()
+            if not database or not collection:
+                self._set_export_status("请选择目标数据库和源 Collection 后再执行聚合。", "error")
+                return
+            try:
+                pipeline = json.loads(self.custom_sql.toPlainText())
+            except json.JSONDecodeError:
+                self._set_export_status("MongoDB 聚合管道必须是有效的 JSON 数组。", "error")
+                return
+            if not isinstance(pipeline, list) or not all(isinstance(stage, dict) and len(stage) == 1 for stage in pipeline):
+                self._set_export_status("MongoDB 聚合管道必须是由单操作对象组成的 JSON 数组。", "error")
+                return
+            if any("$out" in stage or "$merge" in stage for stage in pipeline):
+                self._set_export_status("MongoDB 聚合仅允许只读阶段，不能使用 $out 或 $merge。", "error")
+                return
+            request = MongoAggregationRequest(database, collection, tuple(pipeline), destination, max_rows)
+        elif self._is_custom_sql_mode():
+            if self._database_type() is DatabaseType.MONGODB:
+                self._set_export_status("MongoDB 暂不支持自定义 SQL，请使用图形化配置。", "error")
+                return
+            if self._database_type() is not DatabaseType.SQLITE and not self._selected_custom_database():
+                self._set_export_status("请选择目标数据库后再执行自定义 SQL。", "error")
+                return
+            query = self.custom_sql.toPlainText().strip()
+            if not query:
+                self._set_export_status("请输入自定义 SQL 查询。", "error")
+                return
+            request = CustomSqlRequest(query=query, destination=destination, max_rows=max_rows)
+        else:
+            request = self._build_graphical_export_request(destination, max_rows)
+            if request is None:
+                return
+        self._set_export_progress(0)
+        self._export_total = 0
+        self._set_export_status("正在读取查询结果总数，请稍候…", "idle")
+        self.export_button.setEnabled(False)
+        self.cancel_button.setEnabled(True)
+        self._thread = QThread(self)
+        self._worker = ExportWorker(None, request, self._config())
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.total_ready.connect(self._on_total_ready)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.finished.connect(self._export_finished)
+        self._worker.failed.connect(self._export_failed)
+        self._worker.finished.connect(self._thread.quit)
+        self._worker.failed.connect(self._thread.quit)
+        self._thread.finished.connect(self._cleanup_worker)
+        self._thread.start()
+
+    def _build_graphical_export_request(self, destination, max_rows):
+        if not self.table.currentText():
+            self._set_export_status("请选择数据表后再开始导出。", "error")
+            return None
         conditions = []
         if self.enable_filter.isChecked():
             for item in self.filter_rows:
@@ -492,7 +858,7 @@ class MainWindow(QMainWindow):
             if not sort_column:
                 self._set_export_status("启用排序后，请选择排序字段。", "error")
                 return
-        request = ExportRequest(
+        return ExportRequest(
             schema=self._selected_schema(),
             table=self.table.currentText(),
             destination=destination,
@@ -502,23 +868,6 @@ class MainWindow(QMainWindow):
             sort_direction=SortDirection(self.sort_direction.currentData()),
             max_rows=max_rows,
         )
-        self._set_export_progress(0)
-        self._export_total = 0
-        self._set_export_status("正在读取查询结果总数，请稍候…", "idle")
-        self.export_button.setEnabled(False)
-        self.cancel_button.setEnabled(True)
-        self._thread = QThread(self)
-        self._worker = ExportWorker(None, request, self._config())
-        self._worker.moveToThread(self._thread)
-        self._thread.started.connect(self._worker.run)
-        self._worker.total_ready.connect(self._on_total_ready)
-        self._worker.progress.connect(self._on_progress)
-        self._worker.finished.connect(self._export_finished)
-        self._worker.failed.connect(self._export_failed)
-        self._worker.finished.connect(self._thread.quit)
-        self._worker.failed.connect(self._thread.quit)
-        self._thread.finished.connect(self._cleanup_worker)
-        self._thread.start()
 
     def _cancel_export(self):
         if self._worker:
@@ -527,11 +876,19 @@ class MainWindow(QMainWindow):
             self.cancel_button.setEnabled(False)
 
     def _on_progress(self, count):
+        if not self._export_total:
+            self._set_export_status("正在导出：{} 行，请勿关闭窗口。".format(count), "idle")
+            return
         progress = int(count * 100 / self._export_total) if self._export_total else 0
         self._set_export_progress(min(100, progress))
         self._set_export_status("正在导出：{}/{} 行，请勿关闭窗口。".format(count, self._export_total), "idle")
 
     def _on_total_ready(self, total_rows, planned_rows):
+        if total_rows < 0:
+            self._export_total = 0
+            self.progress.setRange(0, 0)
+            self._set_export_status("无法预先统计结果总数，正在导出，请勿关闭窗口。", "warning")
+            return
         self._export_total = planned_rows
         if total_rows > planned_rows:
             self._set_export_status("查询结果共 {} 行，本次最多导出 {} 行；正在导出，请勿关闭窗口。".format(total_rows, planned_rows), "idle")

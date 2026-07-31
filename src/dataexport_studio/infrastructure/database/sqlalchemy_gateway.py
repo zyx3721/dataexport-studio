@@ -8,7 +8,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from ...domain.errors import ConnectionError, MetadataError, ValidationError
 from ...domain.filters import build_filter
-from ...domain.models import ConnectionConfig, DatabaseType, ExportRequest, FilterLogic, SortDirection
+from ...domain.models import ConnectionConfig, CustomSqlRequest, DatabaseType, ExportRequest, FilterLogic, SortDirection
 
 
 DEFAULT_DATABASES = {
@@ -83,11 +83,26 @@ def get_schemas(engine: Engine) -> Sequence[str]:
 def get_databases(engine: Engine) -> Sequence[str]:
     if engine.dialect.name != "mssql":
         return get_schemas(engine)
+    return get_server_databases(engine)
+
+
+def get_server_databases(engine: Engine) -> Sequence[str]:
+    """Return databases available on the connected server, rather than schemas."""
     try:
         with engine.connect() as connection:
-            return list(connection.scalars(text("SELECT name FROM sys.databases WHERE state = 0 ORDER BY name")))
+            if engine.dialect.name == "mssql":
+                statement = "SELECT name FROM sys.databases WHERE state = 0 ORDER BY name"
+                return list(connection.scalars(text(statement)))
+            if engine.dialect.name in {"mysql", "mariadb"}:
+                return list(connection.scalars(text("SHOW DATABASES")))
+            if engine.dialect.name == "postgresql":
+                statement = "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname"
+                return list(connection.scalars(text(statement)))
+            if engine.dialect.name == "sqlite":
+                return [Path(engine.url.database).stem] if engine.url.database else []
+            return []
     except SQLAlchemyError as exc:
-        raise MetadataError("无法读取 SQL Server 数据库列表。") from exc
+        raise MetadataError("无法读取服务端数据库列表。") from exc
 
 
 def get_tables(engine: Engine, schema: Optional[str] = None) -> Sequence[str]:
@@ -126,6 +141,133 @@ def stream_rows(engine: Engine, request: ExportRequest) -> tuple[Sequence[str], 
             raise MetadataError("读取数据失败。") from exc
 
     return headers, rows()
+
+
+def count_custom_sql_rows(engine: Engine, request: CustomSqlRequest) -> Optional[int]:
+    query = validate_custom_sql(request.query)
+    count_query = "SELECT COUNT(*) FROM ({}) AS dataexport_query".format(query)
+    try:
+        with engine.connect() as connection:
+            return int(connection.scalar(text(count_query)) or 0)
+    except SQLAlchemyError:
+        return None
+
+
+def stream_custom_sql_rows(engine: Engine, request: CustomSqlRequest) -> tuple[Sequence[str], Iterator[tuple]]:
+    query = validate_custom_sql(request.query)
+    connection = None
+    result = None
+    try:
+        connection = engine.connect().execution_options(stream_results=True)
+        result = connection.execute(text(query))
+        headers = _unique_headers(result.keys())
+    except SQLAlchemyError as exc:
+        if result is not None:
+            result.close()
+        if connection is not None:
+            connection.close()
+        raise MetadataError(_custom_sql_failure_message(exc)) from exc
+
+    def rows() -> Iterator[tuple]:
+        try:
+            for row in result.yield_per(request.batch_size):
+                yield tuple(row)
+        except SQLAlchemyError as exc:
+            raise MetadataError(_custom_sql_failure_message(exc)) from exc
+        finally:
+            result.close()
+            connection.close()
+
+    return headers, rows()
+
+
+def validate_custom_sql(raw_query: str) -> str:
+    query = raw_query.strip()
+    if query.endswith(";"):
+        query = query[:-1].rstrip()
+    if not query:
+        raise ValidationError("请输入自定义 SQL 查询。")
+    tokens = _sql_tokens(query)
+    if not tokens or tokens[0] not in {"SELECT", "WITH"}:
+        raise ValidationError("自定义 SQL 仅允许 SELECT 或 WITH ... SELECT 查询。")
+    forbidden = {"ALTER", "ATTACH", "CALL", "CREATE", "DELETE", "DETACH", "DO", "DROP", "EXEC", "EXECUTE", "GRANT", "INSERT", "MERGE", "PRAGMA", "REVOKE", "TRUNCATE", "UPDATE", "VACUUM"}
+    if any(token in forbidden for token in tokens):
+        raise ValidationError("自定义 SQL 仅允许只读查询，不能包含写入或管理语句。")
+    if ";" in tokens:
+        raise ValidationError("自定义 SQL 仅允许单条查询，不能包含多条语句。")
+    if "INTO" in tokens:
+        raise ValidationError("自定义 SQL 不允许 SELECT INTO。")
+    if "SELECT" not in tokens:
+        raise ValidationError("WITH 查询必须包含最终的 SELECT 语句。")
+    return query
+
+
+def _sql_tokens(query: str) -> list[str]:
+    tokens = []
+    index = 0
+    length = len(query)
+    while index < length:
+        character = query[index]
+        if character in "'\"":
+            quote = character
+            index += 1
+            while index < length:
+                if query[index] == quote:
+                    if quote == "'" and index + 1 < length and query[index + 1] == quote:
+                        index += 2
+                        continue
+                    index += 1
+                    break
+                index += 1
+            continue
+        if character == "[":
+            index = query.find("]", index + 1)
+            index = length if index < 0 else index + 1
+            continue
+        if query.startswith("--", index):
+            newline = query.find("\n", index + 2)
+            index = length if newline < 0 else newline + 1
+            continue
+        if query.startswith("/*", index):
+            closing = query.find("*/", index + 2)
+            index = length if closing < 0 else closing + 2
+            continue
+        if character == ";":
+            tokens.append(";")
+            index += 1
+            continue
+        if character.isalnum() or character == "_":
+            end = index + 1
+            while end < length and (query[end].isalnum() or query[end] == "_"):
+                end += 1
+            tokens.append(query[index:end].upper())
+            index = end
+            continue
+        index += 1
+    return tokens
+
+
+def _unique_headers(headers: Sequence[str]) -> list[str]:
+    counts = {}
+    unique_headers = []
+    for header in headers:
+        count = counts.get(header, 0) + 1
+        counts[header] = count
+        unique_headers.append(header if count == 1 else "{}_{}".format(header, count))
+    return unique_headers
+
+
+def _custom_sql_failure_message(exc: SQLAlchemyError) -> str:
+    detail = str(getattr(exc, "orig", exc)).lower()
+    if "syntax" in detail or "near" in detail:
+        return "自定义 SQL 语法错误，请检查关键字、括号和字段名。"
+    if "permission" in detail or "not authorized" in detail or "access denied" in detail:
+        return "当前账户没有执行该查询所需的只读权限。"
+    if "does not exist" in detail or "no such table" in detail or "invalid object" in detail or "unknown column" in detail:
+        return "查询对象不存在或当前账户无访问权限。"
+    if "timeout" in detail or "timed out" in detail:
+        return "自定义 SQL 查询超时。"
+    return "自定义 SQL 执行失败。请检查查询语句和账户权限。"
 
 
 def _build_export_statement(engine: Engine, request: ExportRequest) -> tuple[Sequence[str], object]:

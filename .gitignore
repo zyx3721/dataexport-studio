@@ -27,6 +27,8 @@ findings.md
 progress.md
 task_plan.md
 docs/项目规划.md
+docs/自定义SQL导出示例.md
+work/*
 
 # 本地私有品牌资源
 assets/icons/*.ico

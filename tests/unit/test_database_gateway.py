@@ -91,6 +91,30 @@ def test_sqlserver_reads_databases_instead_of_schemas():
     assert sqlalchemy_gateway.get_databases(Engine()) == ["master", "CompanyDB"]
 
 
+def test_postgresql_reads_real_server_databases_for_custom_sql():
+    class Connection:
+        def scalars(self, _statement):
+            return ["dataexport_demo", "postgres"]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class Engine:
+        class Dialect:
+            name = "postgresql"
+
+        dialect = Dialect()
+
+        @staticmethod
+        def connect():
+            return Connection()
+
+    assert sqlalchemy_gateway.get_server_databases(Engine()) == ["dataexport_demo", "postgres"]
+
+
 def test_connection_validation_names_the_first_missing_required_field(tmp_path):
     with pytest.raises(ValidationError, match="主机 / IP 不能为空"):
         create_database_engine(ConnectionConfig(DatabaseType.MYSQL, username="reader"))

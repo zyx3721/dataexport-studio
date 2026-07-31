@@ -9,7 +9,7 @@ from pymongo.errors import ConfigurationError, OperationFailure, PyMongoError
 
 from ...domain.errors import ConnectionError, MetadataError, ValidationError
 from ...domain.filters import coerce_value
-from ...domain.models import ConnectionConfig, ExportRequest, FilterCondition, FilterLogic, FilterOperator, SortDirection
+from ...domain.models import ConnectionConfig, ExportRequest, FilterCondition, FilterLogic, FilterOperator, MongoAggregationRequest, SortDirection
 
 
 CONNECT_TIMEOUT_MILLISECONDS = 5_000
@@ -116,6 +116,40 @@ def stream_rows(connection: MongoConnection, request: ExportRequest) -> tuple[Se
                 cursor.close()
         except PyMongoError as exc:
             raise MetadataError("读取 MongoDB 数据失败。") from exc
+
+    return headers, rows()
+
+
+def count_aggregation_rows(connection: MongoConnection, request: MongoAggregationRequest) -> int:
+    collection = _get_collection(connection, request.database, request.collection)
+    try:
+        result = list(collection.aggregate([*request.pipeline, {"$count": "total"}]))
+        return int(result[0]["total"]) if result else 0
+    except PyMongoError as exc:
+        raise MetadataError("无法读取 MongoDB 聚合结果总数。") from exc
+
+
+def stream_aggregation_rows(connection: MongoConnection, request: MongoAggregationRequest) -> tuple[Sequence[str], Iterator[tuple]]:
+    collection = _get_collection(connection, request.database, request.collection)
+    try:
+        cursor = collection.aggregate(list(request.pipeline), batchSize=request.batch_size)
+        first = next(cursor, None)
+    except PyMongoError as exc:
+        raise MetadataError("MongoDB 聚合执行失败。请检查聚合管道和字段名。") from exc
+    if first is None:
+        return [], iter(())
+    headers = list(_flatten_document(first).keys())
+
+    def rows() -> Iterator[tuple]:
+        try:
+            yield tuple(_flatten_document(first).get(header) for header in headers)
+            for document in cursor:
+                flattened = _flatten_document(document)
+                yield tuple(flattened.get(header) for header in headers)
+        except PyMongoError as exc:
+            raise MetadataError("读取 MongoDB 聚合结果失败。") from exc
+        finally:
+            cursor.close()
 
     return headers, rows()
 

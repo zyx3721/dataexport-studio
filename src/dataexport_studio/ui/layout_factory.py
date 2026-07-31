@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLayout,
     QLineEdit,
+    QPlainTextEdit,
     QPushButton,
     QProgressBar,
     QSizePolicy,
@@ -15,7 +16,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..domain.models import DatabaseType, FilterLogic, SortDirection
+from ..domain.models import DatabaseType, FilterLogic, QueryMode, SortDirection
 from .widgets import DropdownBox, StyledCheckBox
 
 
@@ -97,6 +98,17 @@ def build_connection_group(window):
 def build_data_group(window):
     grid = QGridLayout()
     grid.setHorizontalSpacing(18)
+    grid.setVerticalSpacing(12)
+    window.query_mode = DropdownBox()
+    window.query_mode.addItem("图形化配置", QueryMode.GRAPHICAL)
+    window.query_mode.addItem("自定义 SQL", QueryMode.CUSTOM_SQL)
+    window.query_mode.addItem("自定义 MongoDB 聚合", QueryMode.MONGODB_AGGREGATION)
+    window.query_mode.currentIndexChanged.connect(window._update_query_mode)
+    window.custom_database = DropdownBox()
+    window.custom_database.currentIndexChanged.connect(window._switch_custom_database)
+    window.custom_database_control = field("目标数据库", window.custom_database)
+    window.custom_collection = DropdownBox()
+    window.custom_collection_control = field("源 Collection", window.custom_collection)
     window.schema = DropdownBox()
     window.schema.currentIndexChanged.connect(window._load_tables)
     window.table = DropdownBox()
@@ -126,13 +138,32 @@ def build_data_group(window):
     options_layout.addWidget(window.sort_column, 1)
     options_layout.addWidget(window.sort_direction)
     sort_layout.addWidget(window.sort_options)
-    grid.addWidget(field("数据库", window.schema), 0, 0)
-    grid.addWidget(field("数据表", window.table), 0, 1)
-    grid.addWidget(sort_control, 0, 2)
+    window.graphical_data_controls = QWidget()
+    graphical_layout = QGridLayout(window.graphical_data_controls)
+    graphical_layout.setContentsMargins(0, 0, 0, 0)
+    graphical_layout.setHorizontalSpacing(18)
+    graphical_layout.addWidget(field("数据库", window.schema), 0, 0)
+    graphical_layout.addWidget(field("数据表", window.table), 0, 1)
+    graphical_layout.addWidget(sort_control, 0, 2)
+    graphical_layout.setColumnStretch(0, 1)
+    graphical_layout.setColumnStretch(1, 1)
+    graphical_layout.setColumnStretch(2, 1)
+    window.custom_sql = QPlainTextEdit()
+    window.custom_sql.setObjectName("customSql")
+    window.custom_sql.setPlaceholderText("示例：SELECT a.id, b.name FROM orders a LEFT JOIN customers b ON b.id = a.customer_id")
+    window.custom_sql.setMinimumHeight(150)
+    window.custom_sql.setTabChangesFocus(False)
+    window.custom_sql_controls = field("SQL 查询（仅允许单条 SELECT 或 WITH ... SELECT）", window.custom_sql)
+    window.custom_query_label = window.custom_sql_controls.findChild(QLabel, "fieldLabel")
+    grid.addWidget(field("查询方式", window.query_mode), 0, 0)
+    grid.addWidget(window.custom_database_control, 0, 1)
+    grid.addWidget(window.custom_collection_control, 0, 2)
+    grid.addWidget(window.graphical_data_controls, 1, 0, 1, 3)
+    grid.addWidget(window.custom_sql_controls, 2, 0, 1, 3)
     grid.setColumnStretch(0, 1)
     grid.setColumnStretch(1, 1)
     grid.setColumnStretch(2, 1)
-    return section("02", "数据选择", grid, 178)
+    return section("02", "数据选择", grid, 348)
 
 
 def build_filter_group(window):
